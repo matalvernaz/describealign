@@ -37,6 +37,7 @@ MIN_STRETCH_OFFSET = 30
 
 if PLOT_ALIGNMENT_TO_FILE:
   import matplotlib.pyplot as plt
+import time
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import io
@@ -397,6 +398,7 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
   y_midpoint_samples = (y_samples[:-1] + y_samples[1:]) // 2
   progress_update_interval = (video_arr.shape[1] // 100) + 1
   last_progress_update = -1
+  _stretch_start = time.monotonic()
   for i in range(len(x) - 1):
     if diff_y_samples[i] < (MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE) or \
        np.abs(1 - slopes[i]) > MAX_RATE_RATIO_DIFF_ALIGN:
@@ -405,7 +407,9 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     progress = int(y_midpoint_samples[i] // progress_update_interval)
     if progress > last_progress_update:
       last_progress_update = progress
-      print(f"  stretching audio:{progress:3d}%                        \r", end='')
+      elapsed = time.monotonic() - _stretch_start
+      eta_str = f"ETA {elapsed * (100 - progress) / progress:4.0f}s" if progress > 0 else "ETA --"
+      print(f"  stretching audio:{progress:3d}%  {eta_str}            \r", end='')
     # only apply pitch correction if the difference would be noticeable
     if no_pitch_correction or np.abs(1 - slopes[i]) <= JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO or \
        abs(total_offset_samples[i]) < MIN_STRETCH_OFFSET:
@@ -461,6 +465,18 @@ def get_closest_key_frame_time(video_file, time):
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
                                  setts_cmd=None, video_offset=None, after_start_key_frame=None,
                                  median_slope=1.):
+  # probe source video for all audio/subtitle stream counts so every track is preserved
+  audio_stream_titles = []
+  n_subtitle = 0
+  if video_file is not None:
+    probe = ffmpeg.probe(video_file, cmd=get_ffprobe())
+    for s in probe['streams']:
+      if s['codec_type'] == 'audio':
+        audio_stream_titles.append(s.get('tags', {}).get('title', ''))
+      elif s['codec_type'] == 'subtitle':
+        n_subtitle += 1
+  n_audio = len(audio_stream_titles)
+
   # if a media array is given, stretch_audio is enabled and media_arr should be added to the video
   if media_arr is not None:
     media_input = ffmpeg.input('pipe:', format='s16le', acodec='pcm_s16le', ac=2, ar=AUDIO_SAMPLE_RATE)
@@ -472,18 +488,28 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
       #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
       # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
-      write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                    acodec='copy', vcodec='copy', scodec='copy',
-                                    max_interleave_delta='0', loglevel='error',
-                                    **{"c:a:0": "aac", "disposition:a:1": "original",
-                                       "metadata:s:a:1": "title=original",
-                                       "disposition:a:0": "default+visual_impaired+descriptions",
-                                       "metadata:s:a:0": "title=AD"}).overwrite_output()
+      out_kwargs = {
+        'acodec': 'copy', 'vcodec': 'copy', 'scodec': 'copy',
+        'max_interleave_delta': '0', 'loglevel': 'error',
+        'c:a:0': 'aac',
+        'disposition:a:0': 'default+visual_impaired+descriptions',
+        'metadata:s:a:0': 'title=AD',
+      }
+      for i, title in enumerate(audio_stream_titles):
+        label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
+        out_kwargs[f'disposition:a:{i + 1}'] = 'default' if i == 0 else '0'
+        out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
+      streams = [media_input, original_video['v']]
+      if n_audio > 0:
+        streams.append(original_video['a'])
+      if n_subtitle > 0:
+        streams.append(original_video['s'])
+      write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
     run_async_ffmpeg_command(write_command, media_arr, f"write output file: {output_filename}")
   else:
     start_offset = video_offset - after_start_key_frame
     media_input = ffmpeg.input(audio_desc_file, itsoffset=f'{max(0, start_offset):.6f}')
-    original_video = ffmpeg.input(video_file, an=None, ss=f'{after_start_key_frame:.6f}',
+    original_video = ffmpeg.input(video_file, ss=f'{after_start_key_frame:.6f}',
                                   itsoffset=f'{max(0, -start_offset):.6f}', dn=None)
     # wav files don't have codecs compatible with most video containers, so we convert to aac
     audio_codec = 'copy' if os.path.splitext(audio_desc_file)[1] != '.wav' else 'aac'
@@ -493,14 +519,27 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
     sub_stretch = f':duration=\'DURATION*{1./median_slope:.6f}\''
     # add frag_keyframe flag to prevent some players from ignoring audio/video start offsets
     # set both pts and dts simultaneously in video manually, as ts= does not do the same thing
-    write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                  acodec=audio_codec, vcodec='copy', scodec='copy',
-                                  max_interleave_delta='0', loglevel='error',
-                                  strict=standards, movflags='frag_keyframe',
-                                  **{'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
-                                     'bsf:s': f'setts=ts=\'{setts_cmd}\'' + sub_stretch,
-                                     "disposition:a:0": "default+visual_impaired+descriptions",
-                                     "metadata:s:a:0": "title=AD"}).overwrite_output()
+    out_kwargs = {
+      'acodec': 'copy', 'c:a:0': audio_codec, 'vcodec': 'copy', 'scodec': 'copy',
+      'max_interleave_delta': '0', 'loglevel': 'error',
+      'strict': standards, 'movflags': 'frag_keyframe',
+      'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
+      'bsf:s': f'setts=ts=\'{setts_cmd}\'' + sub_stretch,
+      'disposition:a:0': 'default+visual_impaired+descriptions',
+      'metadata:s:a:0': 'title=AD',
+    }
+    for i, title in enumerate(audio_stream_titles):
+      label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
+      # retime each original audio track to stay in sync with the adjusted video timestamps
+      out_kwargs[f'bsf:a:{i + 1}'] = f"setts=ts='{setts_cmd}'"
+      out_kwargs[f'disposition:a:{i + 1}'] = 'default' if i == 0 else '0'
+      out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
+    streams = [media_input, original_video['v']]
+    if n_audio > 0:
+      streams.append(original_video['a'])
+    if n_subtitle > 0:
+      streams.append(original_video['s'])
+    write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
     run_ffmpeg_command(write_command, f"write output file: {output_filename}")
 
 def get_static_ffmpeg_version():
@@ -1007,7 +1046,7 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
 # combines videos with matching audio files (e.g. audio descriptions)
 # this is the main function of this script, it calls the other functions in order
 def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitch_correction=False,
-            output_dir=default_output_dir, alignment_dir=default_alignment_dir):
+            output_dir=default_output_dir, alignment_dir=default_alignment_dir, dry_run=False):
   video_files, has_audio_extensions = get_sorted_filenames(video, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS)
   
   if yes == False and sum(has_audio_extensions) > 0:
@@ -1051,53 +1090,64 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     print("Successfully installed ffmpeg.")
   
   print("Processing files:")
-  
-  for (video_file, audio_desc_file, has_audio_extension) in zip(video_files, audio_desc_files,
-                                                           has_audio_extensions):
+
+  for file_idx, (video_file, audio_desc_file, has_audio_extension) in enumerate(
+      zip(video_files, audio_desc_files, has_audio_extensions)):
     # Output filename (and extension) is the same as input, except the prepend and directory
     output_filename = prepend + os.path.split(video_file)[1]
     output_filename = os.path.join(output_dir, output_filename)
-    print(f" {output_filename}")
-    
+    print(f"File {file_idx + 1}/{len(video_files)}: {os.path.split(video_file)[1]}")
+    print(f" -> {output_filename}")
+
     if (not stretch_audio) and has_audio_extension:
       raise RuntimeError("Argument --stretch_audio is required when both inputs are audio files.")
-    
+
     if os.path.exists(output_filename) and os.path.getsize(output_filename) > 1e5:
       print("   output file already exists, skipping...")
       continue
-    
+
     # print warning if output file's full path is longer than Windows MAX_PATH (260)
     full_output_filename = os.path.abspath(output_filename)
     if IS_RUNNING_WINDOWS and len(full_output_filename) >= 260:
       print("  WARNING: very long output path, ffmpeg may fail...")
-    
+
     num_channels = 2 if stretch_audio else 1
+    _t = time.monotonic()
     print("  reading video file...\r", end='')
     video_arr = parse_audio_from_file(video_file, num_channels)
-    
+    print(f"  read video ({time.monotonic() - _t:.1f}s)          ")
+
+    _t = time.monotonic()
     print("  computing video features... \r", end='')
     video_energy = get_energy(video_arr)
     video_zero_crossings = get_zero_crossings(video_arr)
     video_freq_bands = get_freq_bands(video_arr)
     video_features = [video_energy, video_zero_crossings] + video_freq_bands
-    
+    print(f"  computed video features ({time.monotonic() - _t:.1f}s)          ")
+
     if not stretch_audio:
       del video_arr
-    
+
+    _t = time.monotonic()
     print("  reading audio file...       \r", end='')
     audio_desc_arr = parse_audio_from_file(audio_desc_file, num_channels)
-    
+    print(f"  read audio ({time.monotonic() - _t:.1f}s)          ")
+
+    _t = time.monotonic()
     print("  computing audio features...\r", end='')
     audio_desc_energy = get_energy(audio_desc_arr)
     audio_desc_zero_crossings = get_zero_crossings(audio_desc_arr)
     audio_desc_freq_bands = get_freq_bands(audio_desc_arr)
     audio_desc_features = [audio_desc_energy, audio_desc_zero_crossings] + audio_desc_freq_bands
-    
+    print(f"  computed audio features ({time.monotonic() - _t:.1f}s)          ")
+
     if not stretch_audio:
       del audio_desc_arr
-    
+
+    _t = time.monotonic()
     outputs = align(video_features, audio_desc_features, video_energy, audio_desc_energy)
     audio_desc_times, video_times, similarity_percent, path, median_slope = outputs
+    print(f"  aligned ({time.monotonic() - _t:.1f}s)          ")
     
     del video_energy, video_zero_crossings, video_freq_bands, video_features
     del audio_desc_energy, audio_desc_zero_crossings, audio_desc_freq_bands, audio_desc_features
@@ -1122,19 +1172,26 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       # prevent peaking by rescaling to within +/- 32,766
       video_arr *= (2**15 - 2.) / np.max(np.abs(video_arr))
       
-      print("  processing output file...                   \r", end='')
-      write_replaced_media_to_disk(output_filename, video_arr, None if has_audio_extension else video_file,
-                                   median_slope=median_slope)
-      del video_arr
+      if dry_run:
+        print(f"  [dry run] would write: {output_filename}")
+        del video_arr
+      else:
+        print("  processing output file...                   \r", end='')
+        write_replaced_media_to_disk(output_filename, video_arr, None if has_audio_extension else video_file,
+                                     median_slope=median_slope)
+        del video_arr
     else:
       video_offset = video_times[0] - audio_desc_times[0]
       # to make ffmpeg cut at the last keyframe before the audio starts, use a timestamp after it
       after_start_key_frame = get_closest_key_frame_time(video_file, video_offset)
-      print("  processing output file...                   \r", end='')
-      setts_cmd = encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset)
-      write_replaced_media_to_disk(output_filename, None, video_file, audio_desc_file,
-                                   setts_cmd, video_offset, after_start_key_frame,
-                                   median_slope=median_slope)
+      if dry_run:
+        print(f"  [dry run] would write: {output_filename}")
+      else:
+        print("  processing output file...                   \r", end='')
+        setts_cmd = encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset)
+        write_replaced_media_to_disk(output_filename, None, video_file, audio_desc_file,
+                                     setts_cmd, video_offset, after_start_key_frame,
+                                     median_slope=median_slope)
     
     if PLOT_ALIGNMENT_TO_FILE:
       plot_filename_no_ext = os.path.join(alignment_dir, os.path.splitext(os.path.split(video_file)[1])[0])
@@ -1158,6 +1215,7 @@ if wx is not None:
     settings = {'stretch_audio':       config.getboolean('alignment', 'stretch_audio', fallback=False),
                 'prepend':             config.get('alignment', 'prepend', fallback='ad_'),
                 'no_pitch_correction': config.getboolean('alignment', 'no_pitch_correction', fallback=False),
+                'dry_run':             config.getboolean('alignment', 'dry_run', fallback=False),
                 'output_dir':          config.get('alignment', 'output_dir', fallback=default_output_dir),
                 'alignment_dir':       config.get('alignment', 'alignment_dir', fallback=default_alignment_dir)}
     if not config.has_section('alignment'):
@@ -1211,6 +1269,10 @@ if wx is not None:
       set_tooltip(self.checkbox_no_pitch_correction, "Skips pitch correction step when stretching audio. " + \
                                                      "Requires --stretch_audio to be set, otherwise " + \
                                                      "does nothing.")
+
+      self.checkbox_dry_run = wx.CheckBox(panel_stretch_audio_no_pitch_correction,
+                                          label="dry_run", name="dry_run")
+      set_tooltip(self.checkbox_dry_run, "Run alignment and produce plots without writing output media files.")
       
       self.button_save = wx.Button(self, label="Save")
       self.button_save.Bind(wx.EVT_BUTTON, self.save_settings)
@@ -1244,6 +1306,7 @@ if wx is not None:
       #         sizer_stretch_audio_no_pitch_correction_inner
       #           checkbox_stretch_audio
       #           checkbox_no_pitch_correction
+      #           checkbox_dry_run
       #     sizer_save_cancel
       #       button_save
       #       button_cancel
@@ -1267,6 +1330,7 @@ if wx is not None:
       panel_stretch_audio_no_pitch_correction.SetSizer(sizer_stretch_audio_no_pitch_correction_inner)
       sizer_stretch_audio_no_pitch_correction_inner.Add(self.checkbox_stretch_audio, 0, wx.ALL, 5)
       sizer_stretch_audio_no_pitch_correction_inner.Add(self.checkbox_no_pitch_correction, 0, wx.ALL, 5)
+      sizer_stretch_audio_no_pitch_correction_inner.Add(self.checkbox_dry_run, 0, wx.ALL, 5)
       sizer_save_cancel.Add((0, 0), 3, wx.EXPAND, 5)  # spacer
       sizer_save_cancel.Add(self.button_save, 0, wx.ALL|wx.ALIGN_CENTER_VERTICAL, 5)
       sizer_save_cancel.Add((0, 0), 2, wx.EXPAND, 5)  # spacer
@@ -1778,13 +1842,19 @@ def command_line_interface():
                       help='Directory combined output media is saved to. Default is "videos_with_ad"')
   parser.add_argument("--alignment_dir", default=default_alignment_dir,
                       help='Directory alignment data and plots are saved to. Default is "alignment_plots"')
+  parser.add_argument('--dry-run', action='store_true',
+                      help='Run alignment and produce plots without writing output media files.')
+  parser.add_argument('--watch', action='store_true',
+                      help='Watch input directories for new file pairs and process them automatically.')
+  parser.add_argument('--watch-interval', type=int, default=30, metavar='SECONDS',
+                      help='Seconds between directory scans in watch mode (default: 30).')
   parser.add_argument("--install-ffmpeg", action="store_true",
                       help="Install the required ffmpeg binaries and then exit. This is meant to be " + \
                            "run from a privileged installer process (e.g. OS X Installer)")
   parser.add_argument('--version', action='store_true',
                       help='Checks and prints the installed version of describealign.')
   args = parser.parse_args()
-  
+
   if args.version:
     print(f"version: {__version__}")
     if "__compiled__" in globals() or getattr(sys, 'frozen', False):
@@ -1811,8 +1881,22 @@ def command_line_interface():
     os.chmod(get_ffmpeg(), 0o755)
     os.chmod(get_ffprobe(), 0o755)
   elif args.video and args.audio:
-    combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend, 
-            args.no_pitch_correction, args.output_dir, args.alignment_dir)
+    if args.watch:
+      print(f"Watch mode active, scanning every {args.watch_interval}s. Press Ctrl+C to stop.")
+      while True:
+        try:
+          combine(args.video, args.audio, args.stretch_audio, True, args.prepend,
+                  args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run)
+        except KeyboardInterrupt:
+          print("\nWatch mode stopped.")
+          break
+        except Exception as e:
+          print(f"  Watch: {e}")
+        print(f"Watch: sleeping {args.watch_interval}s...")
+        time.sleep(args.watch_interval)
+    else:
+      combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend,
+              args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run)
   else:
     parser.print_usage()
 
