@@ -10,7 +10,13 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: ubuntu-22.04
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
 
     runs-on: ${{ matrix.os }}
 
@@ -35,20 +41,28 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          architecture: "x64"
+          python-version: ${{ matrix.python-version }}
           cache: "pip"
           cache-dependency-path: |
             **/requirements*.txt
 
       - name: Install Dependencies
+        if: ${{ runner.os != 'Linux' }}
         run: |
           pip install -U pip wheel
           pip install -Ur requirements.txt
           pip install -Ur build-requirements.txt
 
+      - name: Install Dependencies (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          pip install -U pip wheel
+          pip install -Ur requirements.txt --find-links https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-22.04/
+          pip install -Ur build-requirements.txt
+
       - name: Set build vars
         id: build-vars
+        shell: bash
         run: echo "version=$(cat version)" >> "$GITHUB_OUTPUT"
 
       - name: Build Executable
