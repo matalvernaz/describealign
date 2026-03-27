@@ -1,5 +1,9 @@
-name: Build
-on: push
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
 
 jobs:
   build:
@@ -30,8 +34,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10" # Version range or exact version of a Python version to use, using SemVer's version range syntax
-          architecture: "x64" # optional x64 or x86. Defaults to x64 if not specified
+          python-version: "3.10"
+          architecture: "x64"
           cache: "pip"
           cache-dependency-path: |
             **/requirements*.txt
@@ -52,9 +56,8 @@ jobs:
         env:
           APP_VERSION: ${{ steps.build-vars.outputs.version }}
 
-      - name: Build artifacts
+      - name: Build artifacts (macOS)
         if: ${{ runner.os == 'macOS' }}
-        id: build-artifacts-mac
         run: |
           pkgbuild \
             --install-location /Applications \
@@ -64,17 +67,16 @@ jobs:
           productbuild \
             --package /tmp/describealign-component.pkg \
             --product Package/product.plist \
-            --version '${{steps.build-vars.outputs.version}}' \
+            --version '${{ steps.build-vars.outputs.version }}' \
             dist/describealign.pkg
 
-      - name: Build artifacts
+      - name: Build artifacts (Linux)
         if: ${{ runner.os == 'Linux' }}
-        id: build-artifacts-linux
         working-directory: dist
         run: |
           tar cvzf describealign.tar.gz describealign
 
-      - name: Archive Release
+      - name: Build artifacts (Windows)
         if: ${{ runner.os == 'Windows' }}
         uses: thedoctor0/zip-release@0.7.5
         with:
@@ -82,13 +84,33 @@ jobs:
           directory: dist
           path: describealign
           filename: 'describealign.zip'
-    
-      - name: Upload Artifacts
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ runner.os }} Build
+          name: ${{ runner.os }}-build
           path: |
             dist/*.pkg
             dist/*.tar.gz
             dist/*.zip
           if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
