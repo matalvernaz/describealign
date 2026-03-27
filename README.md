@@ -6,71 +6,49 @@ Combines videos with matching audio files (e.g. audio descriptions). Works by al
 
 Create a copy of a video file with the sound replaced by an audio description:
 
-<img src="https://github.com/julbean/describealign/blob/main/readme_media/describealign_gui_main.PNG" alt="GUI main" align="middle" width="50%"/>
+<img src="https://github.com/matalvernaz/describealign/blob/main/readme_media/describealign_gui_main.PNG" alt="GUI main" align="middle" width="50%"/>
 
 Select a video file and a corresponding audio description using the file browsers, then click "Combine":
 
-<img src="https://github.com/julbean/describealign/blob/main/readme_media/describealign_gui_combiner.PNG" alt="GUI combiner" align="middle" width="50%"/>
+<img src="https://github.com/matalvernaz/describealign/blob/main/readme_media/describealign_gui_combiner.PNG" alt="GUI combiner" align="middle" width="50%"/>
 
-The combined media is saved in the folder "videos_with_ad" placed in the directory describealign was run in. The directory that combined media files are saved in can be changed in "Settings":
+The combined media is saved in the folder "videos_with_ad" placed in the home directory. The output directory and other settings can be changed in "Settings":
 
-<img src="https://github.com/julbean/describealign/blob/main/readme_media/describealign_gui_settings.PNG" alt="GUI combiner" align="middle" width="50%"/>
+<img src="https://github.com/matalvernaz/describealign/blob/main/readme_media/describealign_gui_settings.PNG" alt="GUI settings" align="middle" width="50%"/>
 
 
 ## Installation
 
 ### binary method
 
-Windows and Mac users can download and unzip the [latest release](https://github.com/julbean/describealign/releases/latest), then double click on describealign.exe to open the GUI.
+Windows, Mac, and Linux users can download and unzip the [latest release](https://github.com/matalvernaz/describealign/releases/latest), then double click on describealign.exe (Windows) or the describealign executable to open the GUI.
 
-Note for Mac binary users: To open the binary, you'll need to ctrl+click (or right click) on the binary, then click "Open" and then click "Open" again in the window that pops up. This minor annoyance is a result of my unwillingness to pay Apple $100 a year.
-
-### package method
-
-This script is compatible with Python versions 3.8 and up. Versions before that won't work (it relies on a recent update to Scipy's linprog).
-
-describealign is available with pip:
-```bash
-pip install describealign
-```
-Note: You may need to add the folder Python's pip.exe is in to your system path. It might be something like: "C:/Users/User/AppData/Local/Programs/Python/Python310/Scripts" Don't forget to restart command prompt after updating the PATH!
-
-The GUI can then be opened from console/command prompt in any directory with:
-```bash
-describealign
-```
-Note: You may need to add the folder Python's compiled scripts (e.g. describealign.exe) are kept in to your system path. It may be a different folder than pip's, like AppData/Roaming instead of AppData/Local.
+Note for Mac binary users: To open the binary, you'll need to ctrl+click (or right click) on the binary, then click "Open" and then click "Open" again in the window that pops up.
 
 ### script method
 
-Alternatively, the python script (describealign.py) can be downloaded from here and run directly (with Python 3.8+) after installing the dependencies manually (requirements.txt):
+The python script (describealign.py) can be downloaded and run directly (with Python 3.8+) after installing the dependencies:
 ```bash
 pip install -r requirements.txt
 python3 describealign.py
 ```
 
-### updating
-
-When new versions are released, the pip package can be updated with:
-```bash
-pip install describealign --upgrade
-```
 
 ## Testing Installation
 
 The installation can be tested on a clip from the 1929 comedy short [Ask Dad](https://archive.org/details/ask_dad), with the first part of an [audio description](https://archive.org/details/MoviesForTheBlind01-askDad) provided by Valerie H. in her podcast [Movies For the Blind.](https://moviesfortheblind.com/) Download the trimmed versions from the test_media folder in this repository, then select them in the GUI:
 
-<img src="https://github.com/julbean/describealign/blob/main/readme_media/describealign_gui_main_filled.PNG" alt="GUI main filled" align="middle" width="50%"/>
+<img src="https://github.com/matalvernaz/describealign/blob/main/readme_media/describealign_gui_main_filled.PNG" alt="GUI main filled" align="middle" width="50%"/>
 
 This produces two outputs, a new video file "videos_with_ad/ad_ask_dad_trimmed.mp4" and a plot in alignment_plots:
 
-<img src="https://github.com/julbean/describealign/blob/main/readme_media/ask_dad_trimmed.png" alt="Ask Dad Trimmed Alignment" align="middle" width="50%"/>
+<img src="https://github.com/matalvernaz/describealign/blob/main/readme_media/ask_dad_trimmed.png" alt="Ask Dad Trimmed Alignment" align="middle" width="50%"/>
 
 The plot shows the audio description starts 202 seconds before the video, which means Valerie starts describing Ask Dad 202 seconds into the podcast. After 40 more seconds, the podcast skips ahead by 3 seconds.
 
 If the full video (22 minutes) and audio description (27 minutes) are used instead, describealign runs in about 30 seconds, using up about 630 MB of RAM, and we get the following plot:
 
-<img src="https://github.com/julbean/describealign/blob/main/readme_media/ask_dad.png" alt="Ask Dad Alignment" align="middle" width="50%"/>
+<img src="https://github.com/matalvernaz/describealign/blob/main/readme_media/ask_dad.png" alt="Ask Dad Alignment" align="middle" width="50%"/>
 
 This plot shows a number of small skips starting around 10 minutes in, which add up to a total offset of 30 seconds by the end of the video.
 
@@ -107,13 +85,30 @@ describealign opens in either light or dark mode depending on the OS's desktop t
 
 ### stretch_audio (audio-to-video alignment)
 
-By default describealign stretches video to fit audio descriptions, but the inverse is also possible: stretching the audio description to fit the video with the "--stretch_audio" argument. This argument also keeps the video's original audio tracks, adding the audio description as the first track and setting it as the default audio.
+By default describealign stretches video to fit audio descriptions, but the inverse is also possible: stretching the audio description to fit the video with the "--stretch_audio" argument. In both modes, all original audio tracks from the video are preserved in the output alongside the audio description track (which is set as the default).
 
 When using --stretch_audio, the plot also shows which segments of audio were replaced:
 
-<img src="https://github.com/julbean/describealign/blob/main/readme_media/ask_dad_stretch_audio.png" alt="Ask Dad Stretch Audio Alignment" align="middle" width="50%"/>
+<img src="https://github.com/matalvernaz/describealign/blob/main/readme_media/ask_dad_stretch_audio.png" alt="Ask Dad Stretch Audio Alignment" align="middle" width="50%"/>
 
-The original audio is used for segments that would be too noticably distorted (i.e. more than 10% stretched).
+The original audio is used for segments that would be too noticeably distorted (i.e. more than 10% stretched).
+
+### dry run
+
+Running with `--dry-run` performs the full alignment and saves the alignment plot, but skips writing the output media file. Useful for quickly checking alignment quality before committing to a slow stretch operation:
+```bash
+describealign video.mp4 audio_desc.mp3 --dry-run
+```
+
+### watch mode
+
+Running with `--watch` monitors the input directories and automatically processes new file pairs as they appear. Useful for automated pipelines (e.g. processing audio descriptions as they are downloaded):
+```bash
+describealign /videos /audio_descriptions --watch
+describealign /videos /audio_descriptions --watch --watch-interval 60
+```
+
+The `--watch-interval` option controls how often the directories are scanned in seconds (default: 30). Already-processed files are skipped on each scan. Press Ctrl+C to stop.
 
 ### audio-to-audio
 
@@ -149,6 +144,3 @@ describealign is robust enough to align media with completely different dialogue
 ### lossless video editing
 
 With default settings (i.e. --stretch_audio set to False), describealign doesn't re-encode either the video or audio streams. It aligns them by modifying the timestamps that video frames are shown at, which means no loss in quality. Basic video editing can be done by deleting or stretching segments of a video's sound in Audacity, then running describealign on the original video and the modified audio.
-
-
-
