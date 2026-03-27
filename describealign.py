@@ -82,10 +82,10 @@ else:
   default_alignment_dir = os.path.expanduser('~') + '/alignment_plots'
 
 def ensure_folders_exist(dirs):
-  for dir in dirs:
-    if not os.path.isdir(dir):
-      print(f"Directory not found, creating it: {dir}")
-      os.makedirs(dir)
+  for folder in dirs:
+    if not os.path.isdir(folder):
+      print(f"Directory not found, creating it: {folder}")
+      os.makedirs(folder)
 
 def get_sorted_filenames(path, extensions, alt_extensions=set([])):
   # path could be three different things: a file, a directory, a list of files
@@ -145,7 +145,7 @@ def get_ffmpeg_version():
   ffmpeg_command = ffmpeg.input('').output('', version='')
   stdout, _ = run_ffmpeg_command(ffmpeg_command, "get version information")
   # strip out leading letter n indicating nightly build (e.g. static_ffmpeg's linux build)
-  version_string = str(stdout).split('version ')[1].lstrip('n')
+  version_string = stdout.decode('utf-8', errors='replace').split('version ')[1].lstrip('n')
   version_major = float(version_string[:2])
   return version_major
 
@@ -157,7 +157,7 @@ def parse_audio_from_file(media_file, num_channels=2):
                                                    af='aresample=async=1:first_pts=0', map='0:a:0',
                                                    ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
   media_stream, _ = run_ffmpeg_command(ffmpeg_command, f"parse audio from input file: {media_file}")
-  media_arr = np.frombuffer(media_stream, np.int16).astype(np.float16).reshape((-1, num_channels)).T
+  media_arr = np.frombuffer(media_stream, np.int16).astype(np.float32).reshape((-1, num_channels)).T
   return media_arr
 
 def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
@@ -216,12 +216,12 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
     print("Main changes needed to video to align it to audio input:", file=file)
     print(f"Start Offset: {-video_offset:.2f} seconds", file=file)
     print(f"Median Rate Change: {(median_slope-1.)*100:.2f}%", file=file)
+    def str_from_time(seconds):
+      minutes, seconds = divmod(seconds, 60)
+      hours, minutes = divmod(minutes, 60)
+      return f"{hours:2.0f}:{minutes:02.0f}:{seconds:06.3f}"
     for i in range(len(video_times) - 1):
       slope = (video_times[i+1] - video_times[i]) / (audio_times[i+1] - audio_times[i])
-      def str_from_time(seconds):
-        minutes, seconds = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours:2.0f}:{minutes:02.0f}:{seconds:06.3f}"
       print(f"Rate change of {(slope-1.)*100:8.1f}% from {str_from_time(video_times[i])} to " + \
             f"{str_from_time(video_times[i+1])} aligning with audio from " + \
             f"{str_from_time(audio_times[i])} to {str_from_time(audio_times[i+1])}", file=file)
@@ -441,7 +441,7 @@ def get_ffprobe():
   return static_ffmpeg.run._get_or_fetch_platform_executables_else_raise_no_lock()[1]
 
 def get_key_frame_data(video_file, time=None, entry='pts_time'):
-  interval = f'%+{max(60,time+40)}' if time != None else '%'
+  interval = f'%+{max(60,time+40)}' if time is not None else '%'
   key_frames = ffmpeg.probe(video_file, cmd=get_ffprobe(), select_streams='V', show_frames=None, 
                             skip_frame='nokey', read_intervals=interval,
                             show_entries='frame='+entry)['frames']
@@ -1047,7 +1047,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     print("Downloading and installing ffmpeg (media editor, 50 MB download)...")
     get_ffmpeg()
     if not is_ffmpeg_installed():
-      RuntimeError("Failed to install ffmpeg.")
+      raise RuntimeError("Failed to install ffmpeg.")
     print("Successfully installed ffmpeg.")
   
   print("Processing files:")
@@ -1059,7 +1059,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     output_filename = os.path.join(output_dir, output_filename)
     print(f" {output_filename}")
     
-    if (not stretch_audio) & has_audio_extension:
+    if (not stretch_audio) and has_audio_extension:
       raise RuntimeError("Argument --stretch_audio is required when both inputs are audio files.")
     
     if os.path.exists(output_filename) and os.path.getsize(output_filename) > 1e5:
@@ -1632,8 +1632,8 @@ if wx is not None:
       # track the allowed file types and selected files' full paths for each List Ctrl
       self.list_ctrl_file_types_browse = {self.list_ctrl_video: self.video_and_audio_file_types,
                                           self.list_ctrl_audio: self.audio_file_types}
-      self.list_ctrl_file_types_drop = {self.list_ctrl_video: self.video_file_types,
-                                        self.list_ctrl_audio: self.audio_file_types}
+      self.list_ctrl_file_types_drop = {self.list_ctrl_video: VIDEO_EXTENSIONS,
+                                        self.list_ctrl_audio: AUDIO_EXTENSIONS}
       self.list_ctrl_files_selected = {self.list_ctrl_video: [],
                                        self.list_ctrl_audio: []}
       
@@ -1733,7 +1733,7 @@ def get_version_hash(filename):
       data = f.read()
       sha_hash = hashlib.sha1(data).hexdigest()
     return sha_hash[:8]
-  except:
+  except Exception:
     return "None"
 
 # Entry point for command line interaction, for example:
