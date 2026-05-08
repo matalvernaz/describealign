@@ -1,4 +1,4 @@
-__version__ = '2.0.5'
+__version__ = '2.1.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -34,6 +34,13 @@ MAX_RATE_RATIO_DIFF_ALIGN = .1
 MIN_DURATION_TO_REPLACE_SECONDS = 2
 JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO = .005
 MIN_STRETCH_OFFSET = 30
+
+# Crossfade applied at the boundary between an AD-replaced span and an
+# original-audio span (segments skipped because their slope/duration falls
+# outside the replace thresholds). Without this, broadcast-source AD vs
+# streaming-source video produces audible "AD voice → raw episode audio →
+# AD voice" pop transitions at every commercial-break seam.
+SEAM_CROSSFADE_SECONDS = 0.2
 
 if PLOT_ALIGNMENT_TO_FILE:
   import matplotlib.pyplot as plt
@@ -399,9 +406,36 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
   progress_update_interval = (video_arr.shape[1] // 100) + 1
   last_progress_update = -1
   _stretch_start = time.monotonic()
-  for i in range(len(x) - 1):
-    if diff_y_samples[i] < (MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE) or \
-       np.abs(1 - slopes[i]) > MAX_RATE_RATIO_DIFF_ALIGN:
+  num_segments = len(x) - 1
+  replace_mask = np.array([
+    (diff_y_samples[i] >= MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE
+     and np.abs(1 - slopes[i]) <= MAX_RATE_RATIO_DIFF_ALIGN)
+    for i in range(num_segments)
+  ])
+
+  # Snapshot the original video audio at every AD-region boundary BEFORE the
+  # main loop overwrites it, so we can equal-power crossfade the seam later.
+  fade_samples_max = int(SEAM_CROSSFADE_SECONDS * AUDIO_SAMPLE_RATE)
+  saved_at_starts = []  # list of (sample_index, original_chunk)
+  saved_at_ends = []
+  for i in range(num_segments):
+    if not replace_mask[i]:
+      continue
+    is_prev_replaced = i > 0 and replace_mask[i - 1]
+    is_next_replaced = i + 1 < num_segments and replace_mask[i + 1]
+    if not is_prev_replaced:
+      s = int(y_samples[i])
+      n = min(fade_samples_max, int(diff_y_samples[i]))
+      if n > 0:
+        saved_at_starts.append((s, video_arr[:, s:s + n].copy()))
+    if not is_next_replaced:
+      e = int(y_samples[i + 1])
+      n = min(fade_samples_max, int(diff_y_samples[i]))
+      if n > 0:
+        saved_at_ends.append((e, video_arr[:, e - n:e].copy()))
+
+  for i in range(num_segments):
+    if not replace_mask[i]:
       continue
     video_arr_slice = video_arr[:,slice(*y_samples[i:i+2])]
     progress = int(y_midpoint_samples[i] // progress_update_interval)
@@ -418,6 +452,20 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       video_arr_slice[:] = audio_desc_arr_interp(sample_points)
     else:
       stretch(audio_desc_arr[:,slice(*x_samples[i:i+2])], video_arr_slice)
+
+  # Equal-power crossfade at every AD-region boundary.
+  for s, original_chunk in saved_at_starts:
+    n = original_chunk.shape[1]
+    t = np.linspace(0., 1., n, dtype=np.float32)
+    ad_gain = np.sin(0.5 * np.pi * t).astype(np.float32) ** 2
+    orig_gain = np.cos(0.5 * np.pi * t).astype(np.float32) ** 2
+    video_arr[:, s:s + n] = video_arr[:, s:s + n] * ad_gain + original_chunk * orig_gain
+  for e, original_chunk in saved_at_ends:
+    n = original_chunk.shape[1]
+    t = np.linspace(0., 1., n, dtype=np.float32)
+    ad_gain = np.cos(0.5 * np.pi * t).astype(np.float32) ** 2
+    orig_gain = np.sin(0.5 * np.pi * t).astype(np.float32) ** 2
+    video_arr[:, e - n:e] = video_arr[:, e - n:e] * ad_gain + original_chunk * orig_gain
 
 # Convert piece-wise linear fit to ffmpeg expression for editing video frame timestamps
 def encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset):
