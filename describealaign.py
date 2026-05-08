@@ -1,4 +1,4 @@
-__version__ = '3.3.0'
+__version__ = '3.4.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -188,15 +188,99 @@ def get_ffmpeg_version():
   version_major = float(version_string[:2])
   return version_major
 
+# Default parsed-audio cache directory. Override via the
+# DESCRIBEALAIGN_AUDIO_CACHE_DIR environment variable.
+def _default_audio_cache_dir():
+  custom = os.environ.get('DESCRIBEALAIGN_AUDIO_CACHE_DIR')
+  if custom:
+    return custom
+  return str(platformdirs.user_cache_path(appname='describealaign', ensure_exists=False) / 'audio')
+
+# Total cache size cap (bytes). When writing a new entry would exceed this,
+# the oldest-by-mtime entries are evicted until the new write fits.
+AUDIO_CACHE_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
+
+
+def _audio_cache_key(media_file, num_channels):
+  """Cache key combining (canonical path, mtime, size, sample-rate, channels).
+
+  mtime+size catches every edit short of a file being rewritten with the
+  exact same length and timestamp — won't happen in any real workflow."""
+  abs_path = os.path.abspath(media_file)
+  try:
+    st = os.stat(abs_path)
+  except OSError:
+    return None
+  fingerprint = f"{abs_path}|{st.st_size}|{st.st_mtime_ns}|{AUDIO_SAMPLE_RATE}|{num_channels}"
+  return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:32]
+
+
+def _evict_until_fits(cache_dir, incoming_size_bytes):
+  """Evict oldest entries until the cache (post-add) fits under the cap."""
+  if not os.path.isdir(cache_dir):
+    return
+  entries = []
+  for name in os.listdir(cache_dir):
+    if not name.endswith('.npy'):
+      continue
+    path = os.path.join(cache_dir, name)
+    try:
+      st = os.stat(path)
+    except OSError:
+      continue
+    entries.append((st.st_mtime, st.st_size, path))
+  total = sum(sz for _, sz, _ in entries)
+  if total + incoming_size_bytes <= AUDIO_CACHE_SIZE_BYTES:
+    return
+  entries.sort()  # oldest first
+  for _, sz, path in entries:
+    if total + incoming_size_bytes <= AUDIO_CACHE_SIZE_BYTES:
+      break
+    try:
+      os.remove(path)
+      total -= sz
+    except OSError:
+      pass
+
+
 # read audio from file with ffmpeg and convert to numpy array
-def parse_audio_from_file(media_file, num_channels=2):
+def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
   # retrieve only the first audio track, injecting silence/trimming to force timestamps to match up
   # for example, when the video starts before the audio this fills that starting gap with silence
+
+  # Cache hit avoids the ~60s ffmpeg-decode step on a 45-minute episode —
+  # critical for any retry or tweak-and-rerun workflow.
+  if cache_dir is None:
+    cache_dir = _default_audio_cache_dir()
+  cache_key = _audio_cache_key(media_file, num_channels)
+  cache_path = os.path.join(cache_dir, f"{cache_key}.npy") if cache_key else None
+  if cache_path and os.path.exists(cache_path):
+    try:
+      cached_arr = np.load(cache_path)
+      # Touch mtime so the LRU eviction sees this as recently used.
+      os.utime(cache_path, None)
+      print(f"  audio cache hit ({os.path.basename(media_file)})")
+      return cached_arr
+    except (ValueError, OSError) as exc:
+      print(f"  audio cache read failed, re-decoding: {exc}")
+
   ffmpeg_command = ffmpeg.input(media_file).output('-', format='s16le', acodec='pcm_s16le',
                                                    af='aresample=async=1:first_pts=0', map='0:a:0',
                                                    ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
   media_stream, _ = run_ffmpeg_command(ffmpeg_command, f"parse audio from input file: {media_file}")
   media_arr = np.frombuffer(media_stream, np.int16).astype(np.float32).reshape((-1, num_channels)).T
+
+  if cache_path:
+    try:
+      os.makedirs(cache_dir, exist_ok=True)
+      _evict_until_fits(cache_dir, media_arr.nbytes)
+      tmp = cache_path + '.part'
+      np.save(tmp, media_arr)
+      os.replace(tmp, cache_path)
+    except OSError as exc:
+      # Caching is best-effort; the run still succeeds even if writing fails.
+      print(f"  audio cache write skipped: {exc}")
+
   return media_arr
 
 def probe_duration_seconds(media_file):
