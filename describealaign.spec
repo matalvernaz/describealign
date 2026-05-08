@@ -2,7 +2,7 @@
 import os
 
 a = Analysis(
-    ['describealign.py'],
+    ['describealaign.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -20,7 +20,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='describealign',
+    name='describealaign',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -31,7 +31,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['describealign.png'],
+    icon=['describealaign.png'],
 )
 coll = COLLECT(
     exe,
@@ -40,12 +40,12 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='describealign',
+    name='describealaign',
 )
 app = BUNDLE(
     coll,
-    name='describealign.app',
-    icon='describealign.png',
+    name='describealaign.app',
+    icon='describealaign.png',
     bundle_identifier=None,
     version=os.getenv('APP_VERSION'),
 )

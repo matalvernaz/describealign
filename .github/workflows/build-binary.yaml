@@ -67,7 +67,7 @@ jobs:
 
       - name: Build Executable
         run: |
-          pyinstaller describealign.spec
+          pyinstaller describealaign.spec
         env:
           APP_VERSION: ${{ steps.build-vars.outputs.version }}
 
@@ -77,19 +77,19 @@ jobs:
           pkgbuild \
             --install-location /Applications \
             --scripts Package/scripts \
-            --component dist/describealign.app \
-            /tmp/describealign-component.pkg
+            --component dist/describealaign.app \
+            /tmp/describealaign-component.pkg
           productbuild \
-            --package /tmp/describealign-component.pkg \
+            --package /tmp/describealaign-component.pkg \
             --product Package/product.plist \
             --version '${{ steps.build-vars.outputs.version }}' \
-            dist/describealign.pkg
+            dist/describealaign.pkg
 
       - name: Build artifacts (Linux)
         if: ${{ runner.os == 'Linux' }}
         working-directory: dist
         run: |
-          tar cvzf describealign.tar.gz describealign
+          tar cvzf describealaign.tar.gz describealaign
 
       - name: Build artifacts (Windows)
         if: ${{ runner.os == 'Windows' }}
@@ -97,8 +97,8 @@ jobs:
         with:
           type: 'zip'
           directory: dist
-          path: describealign
-          filename: 'describealign.zip'
+          path: describealaign
+          filename: 'describealaign.zip'
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

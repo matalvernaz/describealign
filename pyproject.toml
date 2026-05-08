@@ -3,9 +3,12 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "describealign"
-authors = [{ name = "Julian Brown", email = "julbean@proton.me" }]
-description = "Combines videos with matching audio files (e.g. audio descriptions)"
+name = "describealaign"
+authors = [
+  { name = "Julian Brown", email = "julbean@proton.me" },
+  { name = "Matt Alvernaz" },
+]
+description = "Combines videos with matching audio files (e.g. audio descriptions). Fork of describealign with PAL/NTSC and seam-crossfade fixes."
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
@@ -16,15 +19,16 @@ classifiers = [
 dynamic = ["version", "dependencies"]
 
 [tool.setuptools]
-py-modules = ["describealign"]
+py-modules = ["describealaign"]
 
 [tool.setuptools.dynamic]
 version = { file = "version" }
 dependencies = { file = "requirements.txt" }
 
 [project.scripts]
-describealign = "describealign:command_line_interface"
+describealaign = "describealaign:command_line_interface"
 
 [project.urls]
-"Homepage" = "https://github.com/julbean/describealign"
-"Bug Tracker" = "https://github.com/julbean/describealign/issues"
+"Homepage" = "https://github.com/matalvernaz/describealaign"
+"Bug Tracker" = "https://github.com/matalvernaz/describealaign/issues"
+"Upstream" = "https://github.com/julbean/describealign"

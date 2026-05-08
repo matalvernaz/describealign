@@ -1,4 +1,4 @@
-__version__ = '2.1.2'
+__version__ = '3.0.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -1322,7 +1322,7 @@ if wx is not None:
   
   class DialogSettings(wx.Dialog):
     def __init__(self, parent, config_path, is_dark):
-      wx.Dialog.__init__(self, parent, title="Settings - describealign", size=wx.Size(450,370),
+      wx.Dialog.__init__(self, parent, title="Settings - describealaign", size=wx.Size(450,370),
                          style=wx.DEFAULT_DIALOG_STYLE|wx.TAB_TRAVERSAL)
       # setting the GUI dialog's font causes all contained elements to inherit that font by default
       self.SetFont(wx.Font(*gui_font))
@@ -1498,7 +1498,7 @@ if wx is not None:
 
   class FrameCombine(wx.Frame):
     def __init__(self, parent, config_path, video_files, audio_files, is_dark):
-      wx.Frame.__init__(self, parent, title="Combining - describealign", size=wx.Size(800,600))
+      wx.Frame.__init__(self, parent, title="Combining - describealaign", size=wx.Size(800,600))
       # setting the GUI frame's font causes all contained elements to inherit that font by default
       self.SetFont(wx.Font(*gui_font))
       self.SetBackgroundColour(gui_background_color_dark if is_dark else gui_background_color_light)
@@ -1678,7 +1678,7 @@ if wx is not None:
 
   class FrameMain(wx.Frame):
     def __init__(self, parent):
-      wx.Frame.__init__(self, parent, title=f"describealign v{__version__}", size=wx.Size(800, 500))
+      wx.Frame.__init__(self, parent, title=f"describealaign v{__version__}", size=wx.Size(800, 500))
       # setting the GUI frame's font causes all contained elements to inherit that font by default
       self.SetFont(wx.Font(*gui_font))
       appearance = wx.SystemSettings.GetAppearance()
@@ -1866,12 +1866,12 @@ if wx is not None:
       dialog_settings.Destroy()
     
     def get_config(self):
-      config_path = platformdirs.user_config_path(appname='describealign', appauthor=False,
+      config_path = platformdirs.user_config_path(appname='describealaign', appauthor=False,
                                                   ensure_exists=True) / 'config.ini'
       old_paths = [
         # Place in chronological order (oldest -> newest)
         Path(__file__).resolve().parent / 'config.ini',
-        platformdirs.user_config_path(appname='describealign', ensure_exists=True) / 'config.ini',
+        platformdirs.user_config_path(appname='describealaign', ensure_exists=True) / 'config.ini',
       ]
       # Get newest existent path
       old_config = next((file for file in reversed(old_paths) if file.exists()), None,)
@@ -1892,7 +1892,7 @@ def get_version_hash(filename):
     return "None"
 
 # Entry point for command line interaction, for example:
-# > describealign video.mp4 audio_desc.mp3
+# > describealaign video.mp4 audio_desc.mp3
 def command_line_interface():
   if len(sys.argv) < 2:
     if wx is not None:
@@ -1912,7 +1912,7 @@ def command_line_interface():
       print("Can't launch GUI and arguments missing.\nGUI dependencies missing.")
   
   parser = argparse.ArgumentParser(description="Replaces a video's sound with an audio description.",
-                                   usage="describealign video_file.mp4 audio_file.mp3")
+                                   usage="describealaign video_file.mp4 audio_file.mp3")
   parser.add_argument("video", help='A video file or directory containing video files.',
                       nargs='?', default=None)
   parser.add_argument("audio", help='An audio file or directory containing audio files.',
@@ -1943,7 +1943,7 @@ def command_line_interface():
                       help="Install the required ffmpeg binaries and then exit. This is meant to be " + \
                            "run from a privileged installer process (e.g. OS X Installer)")
   parser.add_argument('--version', action='store_true',
-                      help='Checks and prints the installed version of describealign.')
+                      help='Checks and prints the installed version of describealaign.')
   args = parser.parse_args()
 
   if args.version:
@@ -1954,12 +1954,12 @@ def command_line_interface():
       import importlib.util
       cur_dir = os.getcwd()
       if sys.path[0] == cur_dir:
-        # ignore describealign.py in current directory
+        # ignore describealaign.py in current directory
         del sys.path[0]
-        installed_spec = importlib.util.find_spec('describealign')
+        installed_spec = importlib.util.find_spec('describealaign')
         sys.path = [cur_dir] + sys.path
       else:
-        installed_spec = importlib.util.find_spec('describealign')
+        installed_spec = importlib.util.find_spec('describealaign')
       this_script_path = os.path.abspath(__file__)
       if installed_spec is None or (this_script_path != os.path.abspath(installed_spec.origin)):
         print("running from downloaded .py file")
@@ -1992,7 +1992,7 @@ def command_line_interface():
     parser.print_usage()
 
 # allows the script to be run on its own, rather than through the package, for example:
-# python3 describealign.py video.mp4 audio_desc.mp3
+# python3 describealaign.py video.mp4 audio_desc.mp3
 if __name__ == "__main__":
   multiprocessing.freeze_support()
   command_line_interface()
