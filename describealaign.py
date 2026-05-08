@@ -1,4 +1,4 @@
-__version__ = '3.4.0'
+__version__ = '3.5.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -57,6 +57,83 @@ _FRAMERATE_CONVERSION_TARGETS = (
     (24.0 / 25.0,   "PAL video ↔ 24fps AD"),
 )
 _FRAMERATE_RATIO_TOLERANCE = 0.0005
+
+
+class AlignmentMismatchError(RuntimeError):
+  """
+  Raised when describealaign cannot align the inputs. Carries a structured
+  diagnostic so consumers (describarr, the GUI, tests) can show users a
+  reason instead of "Alignment failed, are the input files mismatched?".
+  """
+  def __init__(self, message, diagnostic):
+    super().__init__(message)
+    self.diagnostic = diagnostic
+
+
+def diagnose_alignment_failure(video_energy, audio_desc_energy):
+  """
+  Inspect energy envelopes at a failure point and try to identify a likely
+  cause. Returns a dict ready to print/log:
+
+    {"summary": str, "duration_ratio": float, "energy_ratio": float,
+     "video_quiet_fraction": float, "audio_quiet_fraction": float}
+
+  Heuristics here are intentionally conservative — false-positive
+  classifications would mislead the user. When nothing matches a known
+  pattern, ``summary`` is a generic "could not classify" line and the
+  caller can fall back to the raw numbers.
+  """
+  # Energies are at 105-decimation, so length ≈ duration_seconds * 420.
+  v_dur = len(video_energy) / 420.0
+  a_dur = len(audio_desc_energy) / 420.0
+  ratio = a_dur / v_dur if v_dur > 0 else 0.0
+
+  # "quiet" mask matches the not_quiet threshold the algorithm itself uses.
+  QUIET = 0.5
+  v_quiet = float(np.mean(video_energy <= QUIET)) if len(video_energy) else 0.0
+  a_quiet = float(np.mean(audio_desc_energy <= QUIET)) if len(audio_desc_energy) else 0.0
+
+  v_mean = float(np.mean(video_energy)) if len(video_energy) else 0.0
+  a_mean = float(np.mean(audio_desc_energy)) if len(audio_desc_energy) else 0.0
+  energy_ratio = (a_mean / v_mean) if v_mean > 0 else 0.0
+
+  if ratio < 0.5:
+    summary = (f"AD audio is {ratio:.2f}× the video duration "
+               f"({a_dur/60:.1f} min vs {v_dur/60:.1f} min) — likely wrong "
+               f"episode, truncated AD, or a multi-episode video paired "
+               f"with a single-episode AD.")
+  elif ratio > 2.0:
+    summary = (f"AD audio is {ratio:.2f}× the video duration "
+               f"({a_dur/60:.1f} min vs {v_dur/60:.1f} min) — likely a "
+               f"full-season AD against a single episode video.")
+  elif a_quiet > 0.9:
+    summary = (f"AD audio is {a_quiet*100:.0f}% silence — likely an empty "
+               f"or corrupted AD file.")
+  elif v_quiet > 0.9:
+    summary = (f"Video audio is {v_quiet*100:.0f}% silence — the source "
+               f"video may have its primary audio track missing or muted.")
+  elif energy_ratio < 0.05:
+    summary = (f"AD audio is {energy_ratio:.3f}× the video energy — much "
+               f"quieter than expected; verify this is a real AD recording, "
+               f"not a music-only or commentary track.")
+  elif energy_ratio > 20.0:
+    summary = (f"AD audio is {energy_ratio:.1f}× the video energy — much "
+               f"louder than expected; possible normalization/clipping issue.")
+  elif 0.95 <= ratio <= 1.05 and 0.2 <= a_quiet <= 0.7:
+    summary = ("Durations and energy levels look reasonable — the AD and "
+               "video may simply not be matching content.")
+  else:
+    summary = "No obvious cause from energy analysis."
+
+  return {
+    "summary": summary,
+    "duration_ratio": ratio,
+    "video_duration_minutes": v_dur / 60.0,
+    "audio_duration_minutes": a_dur / 60.0,
+    "energy_ratio": energy_ratio,
+    "video_quiet_fraction": v_quiet,
+    "audio_quiet_fraction": a_quiet,
+  }
 
 
 def detect_framerate_conversion(audio_video_duration_ratio):
@@ -981,7 +1058,11 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   path.pop()
   path.reverse()
   if len(path) < max(min(len(video_energy), len(audio_desc_energy)) / 500., 5 * 210):
-    raise RuntimeError("Alignment failed, are the input files mismatched?")
+    diag = diagnose_alignment_failure(video_energy, audio_desc_energy)
+    raise AlignmentMismatchError(
+      f"Alignment failed in pass 1 (matched only {len(path)} points). {diag['summary']}",
+      diagnostic=diag,
+    )
   y, x = np.array(path).T
   
   half_hann_window = hann_window[:samples_per_node-1] / np.sum(hann_window[:samples_per_node-1])
@@ -1273,7 +1354,11 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   path.reverse()
   path = np.array(path)
   if len(path) < max(min(len(video_energy), len(audio_desc_energy)) / 500., 5 * 210):
-    raise RuntimeError("Alignment failed, are the input files mismatched?")
+    diag = diagnose_alignment_failure(video_energy, audio_desc_energy)
+    raise AlignmentMismatchError(
+      f"Alignment failed in pass 2 (refined to only {len(path)} points). {diag['summary']}",
+      diagnostic=diag,
+    )
   y, x, cluster_indices, quals, cum_quals = path.T
   
   nondescription = ((quals == 0) | (quals > .3))
