@@ -779,12 +779,12 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
   out_kwargs = {
     'acodec': 'copy', 'vcodec': 'copy', 'scodec': 'copy',
     'max_interleave_delta': '0', 'loglevel': 'error',
-    'disposition:a:0': 'default+visual_impaired+descriptions',
+    'disposition:a:0': 'default+visual_impaired',
     'metadata:s:a:0': 'title=AD',
   }
   for i, title in enumerate(audio_stream_titles):
     label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
-    out_kwargs[f'disposition:a:{i + 1}'] = 'default' if i == 0 else '0'
+    out_kwargs[f'disposition:a:{i + 1}'] = '0'
     out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
   streams = [ad_input, original['v']]
   if n_audio > 0:
@@ -826,12 +826,12 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
         'acodec': 'copy', 'vcodec': 'copy', 'scodec': 'copy',
         'max_interleave_delta': '0', 'loglevel': 'error',
         'c:a:0': 'aac',
-        'disposition:a:0': 'default+visual_impaired+descriptions',
+        'disposition:a:0': 'default+visual_impaired',
         'metadata:s:a:0': 'title=AD',
       }
       for i, title in enumerate(audio_stream_titles):
         label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
-        out_kwargs[f'disposition:a:{i + 1}'] = 'default' if i == 0 else '0'
+        out_kwargs[f'disposition:a:{i + 1}'] = '0'
         out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
       streams = [media_input, original_video['v']]
       if n_audio > 0:
@@ -859,14 +859,14 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       'strict': standards, 'movflags': 'frag_keyframe',
       'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
       'bsf:s': f'setts=ts=\'{setts_cmd}\'' + sub_stretch,
-      'disposition:a:0': 'default+visual_impaired+descriptions',
+      'disposition:a:0': 'default+visual_impaired',
       'metadata:s:a:0': 'title=AD',
     }
     for i, title in enumerate(audio_stream_titles):
       label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
       # retime each original audio track to stay in sync with the adjusted video timestamps
       out_kwargs[f'bsf:a:{i + 1}'] = f"setts=ts='{setts_cmd}'"
-      out_kwargs[f'disposition:a:{i + 1}'] = 'default' if i == 0 else '0'
+      out_kwargs[f'disposition:a:{i + 1}'] = '0'
       out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
     streams = [media_input, original_video['v']]
     if n_audio > 0:
