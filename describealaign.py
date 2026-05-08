@@ -1,4 +1,4 @@
-__version__ = '3.5.1'
+__version__ = '2.0.7'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -145,6 +145,30 @@ def diagnose_alignment_failure(video_energy, audio_desc_energy):
     "video_quiet_fraction": v_quiet,
     "audio_quiet_fraction": a_quiet,
   }
+
+
+def is_passthrough_alignment(audio_desc_times, video_times, median_slope,
+                             slope_tolerance=0.001):
+  """
+  Return True if the alignment is a near-identity map: median slope ~1.0
+  and every per-segment slope ~1.0. In that case the AD already aligns
+  with video to within rounding noise — no stretch needed, the original
+  AD file can be muxed bit-perfect with at most a constant ``itsoffset``.
+
+  Defaults to a 0.1% tolerance: tight enough that any real PAL/NTSC drift
+  (4.27%) or commercial-break-seam slope (>10%) disqualifies, but loose
+  enough that ordinary sample-level rounding noise doesn't.
+  """
+  if abs(median_slope - 1.0) > slope_tolerance:
+    return False
+  for i in range(len(video_times) - 1):
+    v_diff = video_times[i + 1] - video_times[i]
+    a_diff = audio_desc_times[i + 1] - audio_desc_times[i]
+    if v_diff <= 0 or a_diff <= 0:
+      continue
+    if abs((a_diff / v_diff) - 1.0) > slope_tolerance:
+      return False
+  return True
 
 
 def detect_framerate_conversion(audio_video_duration_ratio):
@@ -809,6 +833,47 @@ def get_closest_key_frame_time(video_file, time):
   next_key_frame_times = key_frame_times[key_frame_times > time]
   next_key_frame = np.min(next_key_frame_times) if len(next_key_frame_times) > 0 else time
   return (prev_key_frame + next_key_frame) / 2.
+
+def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file, video_offset):
+  """
+  Mux the AD source file directly into the output, bit-perfect, with at
+  most a constant ``itsoffset`` to handle the start delay. No decode, no
+  stretch, no re-encode. Used when ``is_passthrough_alignment`` returned
+  True — same-rate inputs that aligned naturally at slope ~1.0.
+
+  Output structure mirrors the stretch_audio path: AD is track 0 with the
+  visual-impaired/descriptions disposition; the original audio + subtitle
+  streams are preserved alongside.
+  """
+  probe = ffmpeg.probe(video_file, cmd=get_ffprobe())
+  audio_stream_titles = [
+    s.get('tags', {}).get('title', '')
+    for s in probe['streams'] if s['codec_type'] == 'audio'
+  ]
+  n_audio = len(audio_stream_titles)
+  n_subtitle = sum(1 for s in probe['streams'] if s['codec_type'] == 'subtitle')
+
+  ad_input = ffmpeg.input(audio_desc_file, itsoffset=f'{max(0, video_offset):.6f}')
+  original = ffmpeg.input(video_file,
+                          itsoffset=f'{max(0, -video_offset):.6f}', dn=None)
+  out_kwargs = {
+    'acodec': 'copy', 'vcodec': 'copy', 'scodec': 'copy',
+    'max_interleave_delta': '0', 'loglevel': 'error',
+    'disposition:a:0': 'default+visual_impaired+descriptions',
+    'metadata:s:a:0': 'title=AD',
+  }
+  for i, title in enumerate(audio_stream_titles):
+    label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
+    out_kwargs[f'disposition:a:{i + 1}'] = 'default' if i == 0 else '0'
+    out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
+  streams = [ad_input, original['v']]
+  if n_audio > 0:
+    streams.append(original['a'])
+  if n_subtitle > 0:
+    streams.append(original['s'])
+  write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
+  run_ffmpeg_command(write_command, f"write output file: {output_filename}")
+
 
 # outputs a new media file with the replaced audio (which includes audio descriptions)
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
@@ -1578,21 +1643,43 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       print("  WARNING: median slope estimation failed, output subtitles may be misaligned")
       median_slope = 1.
 
-    if stretch_audio:
+    # Passthrough optimisation: when the alignment is a near-identity map
+    # (slope ~1.0 across every segment) AND we didn't pre-resample the AD
+    # ourselves (the on-disk file still represents reality), skip the
+    # stretch+re-encode chain entirely and mux the AD bit-perfect with at
+    # most a constant itsoffset. Saves the only audible quality step in
+    # the pipeline for same-rate content.
+    passthrough_offset = video_times[0] - audio_desc_times[0]
+    can_passthrough = (
+        stretch_audio
+        and not has_audio_extension
+        and pre_resample_info is None
+        and is_passthrough_alignment(audio_desc_times, video_times, median_slope)
+    )
+    if can_passthrough:
+      print(f"  passthrough mux (slope ~1.0, offset {passthrough_offset:+.3f}s)")
+      del audio_desc_arr
+      del video_arr
+      if dry_run:
+        print(f"  [dry run] would write: {output_filename}")
+      else:
+        write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file,
+                                         video_offset=passthrough_offset)
+    elif stretch_audio:
       # lower memory usage version of np.std for large arrays
       def low_ram_std(arr):
         avg = np.mean(arr, dtype=np.float64)
         return np.sqrt(np.einsum('ij,ij->i', arr, arr, dtype=np.float64)/np.prod(arr.shape) - (avg**2))
-      
+
       # rescale RMS intensity of audio to match video
       audio_desc_arr *= (low_ram_std(video_arr) / low_ram_std(audio_desc_arr))[:, None]
-      
+
       replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
       del audio_desc_arr
-      
+
       # prevent peaking by rescaling to within +/- 32,766
       video_arr *= (2**15 - 2.) / np.max(np.abs(video_arr))
-      
+
       if dry_run:
         print(f"  [dry run] would write: {output_filename}")
         del video_arr
