@@ -41,6 +41,10 @@ MIN_STRETCH_OFFSET = 30
 # streaming-source video produces audible "AD voice → raw episode audio →
 # AD voice" pop transitions at every commercial-break seam.
 SEAM_CROSSFADE_SECONDS = 0.2
+# How far back from a replaced→non-replaced boundary to scan the AD audio
+# for a natural silence point so the crossfade lands between words, not
+# mid-word.
+SEAM_LOOKBACK_SECONDS = 2.0
 
 
 class AlignmentMismatchError(RuntimeError):
@@ -661,8 +665,43 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
   # Snapshot the original video audio at every AD-region boundary BEFORE the
   # main loop overwrites it, so we can equal-power crossfade the seam later.
   fade_samples_max = int(SEAM_CROSSFADE_SECONDS * AUDIO_SAMPLE_RATE)
-  saved_at_starts = []  # list of (sample_index, original_chunk)
-  saved_at_ends = []
+
+  # For each replaced→non-replaced boundary, scan the last SEAM_LOOKBACK_SECONDS
+  # of the AD audio for the lowest-energy (most silent) window. End the
+  # replacement there so the crossfade lands between words rather than mid-word.
+  _lba_win = 512
+  silence_adjusted_end = {}  # segment index → (adj_y_sample, adj_x_sample)
+  for i in range(num_segments - 1):
+    if not replace_mask[i] or replace_mask[i + 1]:
+      continue
+    end_x, end_y = int(x_samples[i + 1]), int(y_samples[i + 1])
+    slope = slopes[i]
+    if slope <= 0:
+      continue
+    lookback_x = int(SEAM_LOOKBACK_SECONDS * AUDIO_SAMPLE_RATE)
+    search_start = max(int(x_samples[i]) + _lba_win, end_x - lookback_x)
+    if search_start + _lba_win >= end_x:
+      continue
+    best_x = end_x
+    min_e = float('inf')
+    pos = search_start
+    while pos + _lba_win <= end_x:
+      e = float(np.sum(audio_desc_arr[:, pos:pos + _lba_win].astype(np.float32) ** 2))
+      if e < min_e:
+        min_e, best_x = e, pos + _lba_win // 2
+      pos += _lba_win // 2
+    # Only adjust when the silence is meaningfully earlier than the crossfade window.
+    if best_x >= end_x - fade_samples_max:
+      continue
+    offset_x = end_x - best_x
+    adj_y = max(int(y_samples[i]) + fade_samples_max,
+                end_y - int(offset_x / slope))
+    if adj_y < end_y - fade_samples_max:
+      silence_adjusted_end[i] = (adj_y, best_x)
+
+  saved_at_starts = []     # (sample_index, original_chunk)
+  saved_at_ends = []       # (e, original_chunk at [e-n:e])
+  saved_tail_restores = [] # (adj_e, nominal_e, original_chunk) — undo AD tail after adjustment
   for i in range(num_segments):
     if not replace_mask[i]:
       continue
@@ -674,8 +713,16 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       if n > 0:
         saved_at_starts.append((s, video_arr[:, s:s + n].copy()))
     if not is_next_replaced:
-      e = int(y_samples[i + 1])
-      n = min(fade_samples_max, int(diff_y_samples[i]))
+      adj = silence_adjusted_end.get(i)
+      nominal_e = int(y_samples[i + 1])
+      if adj is not None:
+        e = adj[0]
+        tail_len = nominal_e - e
+        if tail_len > 0:
+          saved_tail_restores.append((e, nominal_e, video_arr[:, e:nominal_e].copy()))
+      else:
+        e = nominal_e
+      n = min(fade_samples_max, e - int(y_samples[i]))
       if n > 0:
         saved_at_ends.append((e, video_arr[:, e - n:e].copy()))
 
@@ -697,6 +744,12 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       video_arr_slice[:] = audio_desc_arr_interp(sample_points)
     else:
       stretch(audio_desc_arr[:,slice(*x_samples[i:i+2])], video_arr_slice)
+
+  # Restore original video audio between the silence-adjusted end and the
+  # nominal segment end, undoing the AD replacement in that tail region so
+  # the crossfade lands at a natural pause rather than mid-word.
+  for adj_e, nominal_e, tail_chunk in saved_tail_restores:
+    video_arr[:, adj_e:nominal_e] = tail_chunk
 
   # Equal-power crossfade at every AD-region boundary.
   for s, original_chunk in saved_at_starts:
