@@ -1,4 +1,4 @@
-__version__ = '2.0.8'
+__version__ = '2.1.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -45,6 +45,31 @@ SEAM_CROSSFADE_SECONDS = 0.2
 # for a natural silence point so the crossfade lands between words, not
 # mid-word.
 SEAM_LOOKBACK_SECONDS = 2.0
+# Hard cap on how far the silence search can move the seam earlier — even
+# if a quieter window exists further back, advancing the seam by more than
+# this much risks losing meaningful narration. Tuned so brief AD pauses
+# (typical word/phrase boundaries) still register, but full sentences of
+# active narration cannot be silenced.
+MAX_SEAM_ADVANCE_SECONDS = 0.5
+# Window length used for silence detection. 100 ms RMS gates out individual
+# voiced consonants and 11–20 ms transients, so the detector responds to
+# real pauses between words/phrases rather than glottal stops or brief
+# inter-syllable dips.
+SEAM_SILENCE_WINDOW_SECONDS = 0.1
+# Hop between successive silence-detect windows (50% overlap of the 100 ms
+# integration window).
+SEAM_SILENCE_HOP_SECONDS = 0.05
+# Absolute RMS-amplitude threshold (in raw int16 units) below which a
+# 100 ms window is considered silent. ~ -40 dBFS for normalized audio,
+# loose enough to catch room tone with a quiet narrator breath but tight
+# enough that ordinary speech (which sits well above this) never matches.
+# AD producers' silences typically read at -50 dBFS or below.
+SEAM_SILENCE_RMS_THRESHOLD = 327.0
+# A candidate window must also be at least this many dB below the lookback
+# region's median RMS — guards against false positives in quiet but
+# continuously narrated regions where every window registers below the
+# absolute threshold.
+SEAM_SILENCE_REL_DB = 12.0
 
 
 class AlignmentMismatchError(RuntimeError):
@@ -661,15 +686,47 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
      and np.abs(1 - slopes[i]) <= MAX_RATE_RATIO_DIFF_ALIGN)
     for i in range(num_segments)
   ])
+  # Fill short skipped segments that sit fully inside a continuous run of
+  # replaced segments. Without this, alignment-slope jitter in the middle
+  # of continuous narration can fragment a single AD region into multiple
+  # sub-segments where any sub-segment shorter than
+  # MIN_DURATION_TO_REPLACE_SECONDS is dropped — punching audible holes
+  # of original program audio through active narration. The slope gate
+  # still blocks fundamentally-bad alignments (>10 % rate change), so we
+  # only fill segments that are short by *duration*.
+  for i in range(1, num_segments - 1):
+    if replace_mask[i]:
+      continue
+    if not (replace_mask[i - 1] and replace_mask[i + 1]):
+      continue
+    if diff_y_samples[i] >= MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE:
+      continue
+    if np.abs(1 - slopes[i]) > MAX_RATE_RATIO_DIFF_ALIGN:
+      continue
+    replace_mask[i] = True
 
   # Snapshot the original video audio at every AD-region boundary BEFORE the
   # main loop overwrites it, so we can equal-power crossfade the seam later.
   fade_samples_max = int(SEAM_CROSSFADE_SECONDS * AUDIO_SAMPLE_RATE)
 
   # For each replaced→non-replaced boundary, scan the last SEAM_LOOKBACK_SECONDS
-  # of the AD audio for the lowest-energy (most silent) window. End the
-  # replacement there so the crossfade lands between words rather than mid-word.
-  _lba_win = 512
+  # of the AD audio for an *actual* silent window — not just the quietest
+  # 11 ms slice, which can land mid-narration on a stop consonant or
+  # inter-syllable dip and cause the crossfade to overwrite the AD tail
+  # with original program audio. A candidate must:
+  #   - integrate over a 100 ms RMS window (long enough to gate out
+  #     consonants but short enough to catch real word-boundary pauses),
+  #   - sit below an absolute RMS floor (ordinary speech never qualifies),
+  #   - sit at least SEAM_SILENCE_REL_DB below the local-median RMS,
+  #   - not advance the seam by more than MAX_SEAM_ADVANCE_SECONDS.
+  # When multiple windows qualify we prefer the *latest* one (closest to
+  # the nominal end), so we trim the smallest amount of AD tail necessary
+  # to land on a pause.
+  silence_win = int(SEAM_SILENCE_WINDOW_SECONDS * AUDIO_SAMPLE_RATE)
+  silence_hop = max(1, int(SEAM_SILENCE_HOP_SECONDS * AUDIO_SAMPLE_RATE))
+  max_advance_x = int(MAX_SEAM_ADVANCE_SECONDS * AUDIO_SAMPLE_RATE)
+  abs_rms_threshold = SEAM_SILENCE_RMS_THRESHOLD
+  rel_db_threshold = SEAM_SILENCE_REL_DB
   silence_adjusted_end = {}  # segment index → (adj_y_sample, adj_x_sample)
   for i in range(num_segments - 1):
     if not replace_mask[i] or replace_mask[i + 1]:
@@ -678,23 +735,37 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     slope = slopes[i]
     if slope <= 0:
       continue
-    lookback_x = int(SEAM_LOOKBACK_SECONDS * AUDIO_SAMPLE_RATE)
-    search_start = max(int(x_samples[i]) + _lba_win, end_x - lookback_x)
-    if search_start + _lba_win >= end_x:
+    # Search range: cap the lookback so the seam can't advance more than
+    # MAX_SEAM_ADVANCE_SECONDS no matter how far back true silence is.
+    lookback_x = min(int(SEAM_LOOKBACK_SECONDS * AUDIO_SAMPLE_RATE), max_advance_x)
+    search_start = max(int(x_samples[i]) + silence_win, end_x - lookback_x)
+    if search_start + silence_win >= end_x:
       continue
-    best_x = end_x
-    min_e = float('inf')
-    pos = search_start
-    while pos + _lba_win <= end_x:
-      e = float(np.sum(audio_desc_arr[:, pos:pos + _lba_win].astype(np.float32) ** 2))
-      if e < min_e:
-        min_e, best_x = e, pos + _lba_win // 2
-      pos += _lba_win // 2
-    # Only adjust when the silence is meaningfully earlier than the crossfade window.
+    # Compute per-window RMS across the lookback range.
+    positions = list(range(search_start, end_x - silence_win + 1, silence_hop))
+    if not positions:
+      continue
+    rms_values = []
+    for pos in positions:
+      chunk = audio_desc_arr[:, pos:pos + silence_win].astype(np.float32)
+      rms_values.append(float(np.sqrt(np.mean(chunk ** 2))))
+    rms_arr = np.asarray(rms_values, dtype=np.float64)
+    median_rms = float(np.median(rms_arr))
+    rel_threshold = median_rms * (10.0 ** (-rel_db_threshold / 20.0))
+    qualifies = (rms_arr < abs_rms_threshold) & (rms_arr < rel_threshold)
+    if not np.any(qualifies):
+      continue
+    # Prefer the latest qualifying window — minimises how much AD tail we
+    # discard while still landing on actual silence.
+    qualifying_indices = np.flatnonzero(qualifies)
+    best_idx = int(qualifying_indices[-1])
+    best_x = positions[best_idx] + silence_win // 2
     if best_x >= end_x - fade_samples_max:
       continue
     offset_x = end_x - best_x
-    adj_y = max(int(y_samples[i]) + fade_samples_max,
+    # Require the post-adjustment AD region to retain at least 2× the fade
+    # length so start- and end-fades cannot overlap each other.
+    adj_y = max(int(y_samples[i]) + 2 * fade_samples_max,
                 end_y - int(offset_x / slope))
     if adj_y < end_y - fade_samples_max:
       silence_adjusted_end[i] = (adj_y, best_x)
@@ -752,17 +823,25 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     video_arr[:, adj_e:nominal_e] = tail_chunk
 
   # Equal-power crossfade at every AD-region boundary.
+  # ad_gain² + orig_gain² = sin²(θ) + cos²(θ) = 1, so for uncorrelated
+  # signals the combined power stays constant through the fade — no -3 dB
+  # midpoint dip that would make the narrator's voice sound like it's
+  # ducking under the seam. The previous implementation used sin²/cos²
+  # gains which sum to 1 in *amplitude* (constant amplitude, not constant
+  # power), producing the audible dip. Correlated material can show a
+  # transient peak with true equal-power, which the no-upward-gain
+  # peak-clamp in combine() handles gracefully.
   for s, original_chunk in saved_at_starts:
     n = original_chunk.shape[1]
-    t = np.linspace(0., 1., n, dtype=np.float32)
-    ad_gain = np.sin(0.5 * np.pi * t).astype(np.float32) ** 2
-    orig_gain = np.cos(0.5 * np.pi * t).astype(np.float32) ** 2
+    theta = (0.5 * np.pi) * np.linspace(0., 1., n, dtype=np.float32)
+    ad_gain = np.sin(theta).astype(np.float32)
+    orig_gain = np.cos(theta).astype(np.float32)
     video_arr[:, s:s + n] = video_arr[:, s:s + n] * ad_gain + original_chunk * orig_gain
   for e, original_chunk in saved_at_ends:
     n = original_chunk.shape[1]
-    t = np.linspace(0., 1., n, dtype=np.float32)
-    ad_gain = np.cos(0.5 * np.pi * t).astype(np.float32) ** 2
-    orig_gain = np.sin(0.5 * np.pi * t).astype(np.float32) ** 2
+    theta = (0.5 * np.pi) * np.linspace(0., 1., n, dtype=np.float32)
+    ad_gain = np.cos(theta).astype(np.float32)
+    orig_gain = np.sin(theta).astype(np.float32)
     video_arr[:, e - n:e] = video_arr[:, e - n:e] * ad_gain + original_chunk * orig_gain
 
 # Convert piece-wise linear fit to ffmpeg expression for editing video frame timestamps
@@ -1598,14 +1677,31 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         avg = np.mean(arr, dtype=np.float64)
         return np.sqrt(np.einsum('ij,ij->i', arr, arr, dtype=np.float64)/np.prod(arr.shape) - (avg**2))
 
-      # rescale RMS intensity of audio to match video
-      audio_desc_arr *= (low_ram_std(video_arr) / low_ram_std(audio_desc_arr))[:, None]
+      # Rescale RMS intensity of AD to match video, applying ONE scalar gain
+      # to all channels rather than per-channel ratios. Per-channel scaling
+      # destroys the AD's stereo image whenever the video's L/R energy
+      # balance differs from the AD's: e.g. a 5.1 video downmixed to stereo
+      # often has surround content shifted toward one side, which would pan
+      # the narrator's voice toward the other side after a per-channel
+      # rescale.
+      video_stds = low_ram_std(video_arr)
+      ad_stds = low_ram_std(audio_desc_arr)
+      gain = float(np.mean(video_stds) / np.mean(ad_stds))
+      audio_desc_arr *= gain
 
       replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
       del audio_desc_arr
 
-      # prevent peaking by rescaling to within +/- 32,766
-      video_arr *= (2**15 - 2.) / np.max(np.abs(video_arr))
+      # Prevent peaking by attenuating to within ±32,766 if and only if the
+      # signal already exceeds that range. Unconditionally scaling to peak
+      # would raise the *whole episode's* gain whenever the loudest sample
+      # is below full-scale, and lower it whenever a single seam crossfade
+      # produced a transient overshoot — both perceived as inconsistent
+      # loudness vs. the original.
+      peak = float(np.max(np.abs(video_arr)))
+      limit = 2**15 - 2.0
+      if peak > limit:
+        video_arr *= limit / peak
 
       if dry_run:
         print(f"  [dry run] would write: {output_filename}")
