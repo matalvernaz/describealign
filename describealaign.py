@@ -1,4 +1,4 @@
-__version__ = '2.1.0'
+__version__ = '2.1.1'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -266,14 +266,61 @@ def run_ffmpeg_command(command, err_msg):
     raise
 
 def run_async_ffmpeg_command(command, media_arr, err_msg):
+  # Stream int16 samples to ffmpeg's stdin in fixed-size chunks rather than
+  # materializing the whole (channels * samples * 2) bytes object up front.
+  # The old single-`communicate(media_arr.astype(int16).T.tobytes())` call
+  # peaked at ~2x the waveform size in transient memory (int16 copy + bytes
+  # buffer) on top of the still-resident float32 array — enough to OOM on
+  # multi-hour content. Chunked write holds at most CHUNK_SAMPLES * 2 bytes
+  # at a time.
+  #
+  # A background thread drains stderr concurrently so a long ffmpeg run
+  # writing more than the pipe-buffer to stderr (rare with loglevel=error,
+  # but possible on a sustained warning stream) cannot deadlock against
+  # our stdin-write loop.
+  import threading as _t
+  chunk_samples = 1 << 20  # ≈24s of stereo @ 44.1 kHz; ~4 MB int16 per chunk
+  stderr_chunks: list = []
+
+  def _drain_stderr(proc):
+    if proc.stderr is None:
+      return
+    try:
+      while True:
+        buf = proc.stderr.read(4096)
+        if not buf:
+          break
+        stderr_chunks.append(buf)
+    except (OSError, ValueError):
+      pass
+
   try:
-    ffmpeg_caller = command.run_async(pipe_stdin=True, quiet=True, cmd=get_ffmpeg())
-    out, err = ffmpeg_caller.communicate(media_arr.astype(np.int16).T.tobytes())
-    if len(err) > 0:
+    ffmpeg_caller = command.run_async(pipe_stdin=True, pipe_stderr=True,
+                                      quiet=False, cmd=get_ffmpeg())
+    stderr_thread = _t.Thread(target=_drain_stderr, args=(ffmpeg_caller,), daemon=True)
+    stderr_thread.start()
+    media_arr_T = media_arr.T  # view (samples, channels); no copy
+    try:
+      for start in range(0, media_arr_T.shape[0], chunk_samples):
+        chunk = media_arr_T[start:start + chunk_samples].astype(np.int16)
+        ffmpeg_caller.stdin.write(chunk.tobytes())
+    except BrokenPipeError:
+      # ffmpeg died early; wait() below surfaces the real return code.
+      pass
+    finally:
+      try:
+        ffmpeg_caller.stdin.close()
+      except OSError:
+        pass
+    returncode = ffmpeg_caller.wait()
+    stderr_thread.join(timeout=5.0)
+    err = b''.join(stderr_chunks)
+    if returncode != 0:
       print("  ERROR: ffmpeg failed to " + err_msg)
       print("FFmpeg error:")
-      print(err.decode('utf-8'))
-      raise ChildProcessError('FFmpeg error.')
+      if err:
+        print(err.decode('utf-8', errors='replace'))
+      raise ChildProcessError(f'FFmpeg returned {returncode}.')
   except ffmpeg.Error as e:
     print("  ERROR: ffmpeg failed to " + err_msg)
     print("FFmpeg error:")
@@ -1662,6 +1709,23 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         and not has_audio_extension
         and is_passthrough_alignment(audio_desc_times, video_times, median_slope)
     )
+    # Use a sibling temp path so a crashed/interrupted ffmpeg run can't leave
+    # a >100KB stub at output_filename that the skip-existing check upstream
+    # would treat as success on the next run. Atomic-rename on success.
+    out_dir_for_tmp = os.path.dirname(output_filename) or '.'
+    tmp_output_filename = os.path.join(out_dir_for_tmp, f'.tmp.{os.path.basename(output_filename)}')
+
+    def _atomic_finalize():
+      # Move sibling .tmp into place; called only on successful ffmpeg exit.
+      os.replace(tmp_output_filename, output_filename)
+
+    def _cleanup_tmp():
+      if os.path.exists(tmp_output_filename):
+        try:
+          os.remove(tmp_output_filename)
+        except OSError:
+          pass
+
     if can_passthrough:
       print(f"  passthrough mux (slope ~1.0, offset {passthrough_offset:+.3f}s)")
       del audio_desc_arr
@@ -1669,13 +1733,27 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       if dry_run:
         print(f"  [dry run] would write: {output_filename}")
       else:
-        write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file,
-                                         video_offset=passthrough_offset)
+        try:
+          write_passthrough_media_to_disk(tmp_output_filename, video_file, audio_desc_file,
+                                           video_offset=passthrough_offset)
+          _atomic_finalize()
+        except Exception:
+          _cleanup_tmp()
+          raise
     elif stretch_audio:
-      # lower memory usage version of np.std for large arrays
+      # Per-channel std using the variance-decomposition identity, without
+      # allocating an (channels, samples) diff array. Float64 accumulation
+      # prevents precision drift on long clips, and `maximum(..., 0.0)`
+      # guards against negative-inside-sqrt for DC-offset / constant signals
+      # which would otherwise produce NaN and silently poison every sample
+      # of the muxed output.
       def low_ram_std(arr):
-        avg = np.mean(arr, dtype=np.float64)
-        return np.sqrt(np.einsum('ij,ij->i', arr, arr, dtype=np.float64)/np.prod(arr.shape) - (avg**2))
+        n = arr.shape[1]
+        sums = np.sum(arr, axis=1, dtype=np.float64)
+        sumsq = np.einsum('ij,ij->i', arr, arr, dtype=np.float64)
+        mean = sums / n
+        var = np.maximum(sumsq / n - mean * mean, 0.0)
+        return np.sqrt(var)
 
       # Rescale RMS intensity of AD to match video, applying ONE scalar gain
       # to all channels rather than per-channel ratios. Per-channel scaling
@@ -1686,8 +1764,20 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       # rescale.
       video_stds = low_ram_std(video_arr)
       ad_stds = low_ram_std(audio_desc_arr)
-      gain = float(np.mean(video_stds) / np.mean(ad_stds))
-      audio_desc_arr *= gain
+      ad_level = float(np.mean(ad_stds))
+      if ad_level < 1.0:
+        # AD audio is effectively silent (RMS < 1 int16 unit). Skipping gain
+        # match prevents inf/NaN from corrupting the mux; the alignment that
+        # produced these times will fail downstream anyway, but at least the
+        # original video audio is left intact.
+        print(f"  WARNING: AD audio near-silent (RMS {ad_level:.2f}), skipping gain match")
+      else:
+        gain = float(np.mean(video_stds)) / ad_level
+        # Clamp pathological gains. Real-world AD vs broadcast video sits
+        # within roughly 0.1x-10x; anything beyond that is a sign the AD or
+        # the source is degenerate and we shouldn't blow out the output.
+        gain = max(0.01, min(100.0, gain))
+        audio_desc_arr *= gain
 
       replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
       del audio_desc_arr
@@ -1708,9 +1798,15 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         del video_arr
       else:
         print("  processing output file...                   \r", end='')
-        write_replaced_media_to_disk(output_filename, video_arr, None if has_audio_extension else video_file,
-                                     median_slope=median_slope)
-        del video_arr
+        try:
+          write_replaced_media_to_disk(tmp_output_filename, video_arr, None if has_audio_extension else video_file,
+                                       median_slope=median_slope)
+          _atomic_finalize()
+        except Exception:
+          _cleanup_tmp()
+          raise
+        finally:
+          del video_arr
     else:
       video_offset = video_times[0] - audio_desc_times[0]
       # to make ffmpeg cut at the last keyframe before the audio starts, use a timestamp after it
@@ -1720,9 +1816,14 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       else:
         print("  processing output file...                   \r", end='')
         setts_cmd = encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset)
-        write_replaced_media_to_disk(output_filename, None, video_file, audio_desc_file,
-                                     setts_cmd, video_offset, after_start_key_frame,
-                                     median_slope=median_slope)
+        try:
+          write_replaced_media_to_disk(tmp_output_filename, None, video_file, audio_desc_file,
+                                       setts_cmd, video_offset, after_start_key_frame,
+                                       median_slope=median_slope)
+          _atomic_finalize()
+        except Exception:
+          _cleanup_tmp()
+          raise
     
     if PLOT_ALIGNMENT_TO_FILE:
       plot_filename_no_ext = os.path.join(alignment_dir, os.path.splitext(os.path.split(video_file)[1])[0])
