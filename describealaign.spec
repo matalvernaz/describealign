@@ -5,7 +5,10 @@ a = Analysis(
     ['describealaign.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # Ship the `version` file inside the frozen binary so the runtime
+    # __version__ fallback can read it when importlib.metadata isn't
+    # available (the standalone-binary case).
+    datas=[('version', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

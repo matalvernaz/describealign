@@ -1,4 +1,35 @@
-__version__ = '2.1.1'
+def _read_version():
+  """Single source of truth for ``__version__``.
+
+  Prefers the ``version`` file sitting next to this script (the canonical
+  source-of-truth for source-tree runs and PyInstaller binaries that bundle
+  it via the spec's ``datas``). Falls back to installed-package metadata
+  only when the file isn't present — i.e. the pip-install-without-data path.
+
+  Source-tree-first avoids a subtle drift: a stale ``*.egg-info`` directory
+  left over from an old ``pip install -e .`` would otherwise shadow the
+  current ``version`` file and report the old number.
+  """
+  try:
+    import os as _os
+    version_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'version')
+    with open(version_path) as _vf:
+      return _vf.read().strip()
+  except OSError:
+    pass
+  try:
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError
+    try:
+      return _pkg_version('describealaign')
+    except PackageNotFoundError:
+      pass
+  except ImportError:
+    pass
+  return 'unknown'
+
+
+__version__ = _read_version()
+del _read_version
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
