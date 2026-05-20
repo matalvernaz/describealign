@@ -1018,6 +1018,46 @@ def get_closest_key_frame_time(video_file, time):
   next_key_frame = np.min(next_key_frame_times) if len(next_key_frame_times) > 0 else time
   return (prev_key_frame + next_key_frame) / 2.
 
+# Subtitle codecs whose timestamps live inside the packet itself rather than
+# in the container — ffmpeg's `setts` bitstream filter is a no-op or worse
+# on these, so we never apply it. They are preserved unchanged (and in the
+# stretch_video path they will be inherently out of sync; the alignment
+# user must choose stretch_audio if their source has bitmap subtitles).
+_BITMAP_SUBTITLE_CODECS = frozenset({
+  'hdmv_pgs_subtitle',
+  'dvd_subtitle',
+  'dvb_subtitle',
+  'xsub',
+})
+
+
+def _probe_stream_layout(video_file):
+  """Return a layout dict describing every stream we care about preserving.
+
+  Keys:
+    audio_titles:    list[str] of per-audio-stream titles ('' if untagged)
+    subtitle_codecs: list[str] of per-subtitle-stream codec_name values
+    n_attachment:    int, count of attachment streams (fonts etc.)
+  """
+  probe = ffmpeg.probe(video_file, cmd=get_ffprobe())
+  audio_titles = []
+  subtitle_codecs = []
+  n_attachment = 0
+  for s in probe['streams']:
+    ctype = s.get('codec_type')
+    if ctype == 'audio':
+      audio_titles.append(s.get('tags', {}).get('title', ''))
+    elif ctype == 'subtitle':
+      subtitle_codecs.append(s.get('codec_name', ''))
+    elif ctype == 'attachment':
+      n_attachment += 1
+  return {
+    'audio_titles': audio_titles,
+    'subtitle_codecs': subtitle_codecs,
+    'n_attachment': n_attachment,
+  }
+
+
 def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file, video_offset):
   """
   Mux the AD source file directly into the output, bit-perfect, with at
@@ -1027,15 +1067,14 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
 
   Output structure mirrors the stretch_audio path: AD is track 0 with the
   visual-impaired/descriptions disposition; the original audio + subtitle
-  streams are preserved alongside.
+  streams are preserved alongside. MKV attachments (fonts referenced by
+  ASS/SSA subtitles) are also copied through.
   """
-  probe = ffmpeg.probe(video_file, cmd=get_ffprobe())
-  audio_stream_titles = [
-    s.get('tags', {}).get('title', '')
-    for s in probe['streams'] if s['codec_type'] == 'audio'
-  ]
+  layout = _probe_stream_layout(video_file)
+  audio_stream_titles = layout['audio_titles']
   n_audio = len(audio_stream_titles)
-  n_subtitle = sum(1 for s in probe['streams'] if s['codec_type'] == 'subtitle')
+  n_subtitle = len(layout['subtitle_codecs'])
+  n_attachment = layout['n_attachment']
 
   ad_input = ffmpeg.input(audio_desc_file, itsoffset=f'{max(0, video_offset):.6f}')
   original = ffmpeg.input(video_file,
@@ -1055,6 +1094,8 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
     streams.append(original['a'])
   if n_subtitle > 0:
     streams.append(original['s'])
+  if n_attachment > 0:
+    streams.append(original['t'])
   write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
   run_ffmpeg_command(write_command, f"write output file: {output_filename}")
 
@@ -1063,17 +1104,19 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
                                  setts_cmd=None, video_offset=None, after_start_key_frame=None,
                                  median_slope=1.):
-  # probe source video for all audio/subtitle stream counts so every track is preserved
-  audio_stream_titles = []
-  n_subtitle = 0
+  # probe source video for the full preservable stream layout (audio titles,
+  # subtitle codecs, attachment count) so every track is mapped through.
   if video_file is not None:
-    probe = ffmpeg.probe(video_file, cmd=get_ffprobe())
-    for s in probe['streams']:
-      if s['codec_type'] == 'audio':
-        audio_stream_titles.append(s.get('tags', {}).get('title', ''))
-      elif s['codec_type'] == 'subtitle':
-        n_subtitle += 1
+    layout = _probe_stream_layout(video_file)
+    audio_stream_titles = layout['audio_titles']
+    subtitle_codecs = layout['subtitle_codecs']
+    n_attachment = layout['n_attachment']
+  else:
+    audio_stream_titles = []
+    subtitle_codecs = []
+    n_attachment = 0
   n_audio = len(audio_stream_titles)
+  n_subtitle = len(subtitle_codecs)
 
   # if a media array is given, stretch_audio is enabled and media_arr should be added to the video
   if media_arr is not None:
@@ -1102,6 +1145,8 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
         streams.append(original_video['a'])
       if n_subtitle > 0:
         streams.append(original_video['s'])
+      if n_attachment > 0:
+        streams.append(original_video['t'])
       write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
     run_async_ffmpeg_command(write_command, media_arr, f"write output file: {output_filename}")
   else:
@@ -1122,10 +1167,19 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       'max_interleave_delta': '0', 'loglevel': 'error',
       'strict': standards, 'movflags': 'frag_keyframe',
       'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
-      'bsf:s': f'setts=ts=\'{setts_cmd}\'' + sub_stretch,
       'disposition:a:0': 'default+visual_impaired',
       'metadata:s:a:0': 'title=AD',
     }
+    # Apply the subtitle retime filter ONLY to text-based subtitles. Bitmap
+    # subtitle codecs (PGS/DVDSub/etc) carry their own presentation timestamps
+    # inside the packets — ffmpeg's `setts` bitstream filter either errors
+    # ungracefully or silently drops them. The video is being timestretched
+    # so bitmap subs will be inherently desynced in this branch, but at least
+    # the data survives intact rather than crashing the whole mux.
+    for sub_idx, codec_name in enumerate(subtitle_codecs):
+      if codec_name and codec_name in _BITMAP_SUBTITLE_CODECS:
+        continue
+      out_kwargs[f"bsf:s:{sub_idx}"] = f"setts=ts='{setts_cmd}'" + sub_stretch
     for i, title in enumerate(audio_stream_titles):
       label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
       # retime each original audio track to stay in sync with the adjusted video timestamps
@@ -1137,6 +1191,8 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       streams.append(original_video['a'])
     if n_subtitle > 0:
       streams.append(original_video['s'])
+    if n_attachment > 0:
+      streams.append(original_video['t'])
     write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
     run_ffmpeg_command(write_command, f"write output file: {output_filename}")
 
